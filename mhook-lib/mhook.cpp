@@ -22,7 +22,10 @@
 #include <tlhelp32.h>
 #include <stdio.h>
 #include "mhook.h"
+#include "mhook_internal.h"
+#include "mhook_thread.h"
 #include "../disasm-lib/disasm.h"
+#include "mhook_printf.h"
 
 //=========================================================================
 #ifndef cntof
@@ -30,186 +33,30 @@
 #endif
 
 //=========================================================================
-#ifndef GOOD_HANDLE
-#define GOOD_HANDLE(a) ((a!=INVALID_HANDLE_VALUE)&&(a!=NULL))
-#endif
-
-//=========================================================================
-#ifndef gle
-#define gle GetLastError
-#endif
-
-//=========================================================================
-#ifndef ODPRINTF
-
-#ifdef _DEBUG
-#define ODPRINTF(a) odprintf a
-#else
-#define ODPRINTF(a)
-#endif
-
-inline void __cdecl odprintf(PCSTR format, ...) {
-	va_list	args;
-	va_start(args, format);
-	int len = _vscprintf(format, args);
-	if (len > 0) {
-		len += (1 + 2);
-		PSTR buf = (PSTR) malloc(len);
-		if (buf) {
-			len = vsprintf_s(buf, len, format, args);
-			if (len > 0) {
-				while (len && isspace(buf[len-1])) len--;
-				buf[len++] = '\r';
-				buf[len++] = '\n';
-				buf[len] = 0;
-				OutputDebugStringA(buf);
-			}
-			free(buf);
-		}
-		va_end(args);
-	}
-}
-
-inline void __cdecl odprintf(PCWSTR format, ...) {
-	va_list	args;
-	va_start(args, format);
-	int len = _vscwprintf(format, args);
-	if (len > 0) {
-		len += (1 + 2);
-		PWSTR buf = (PWSTR) malloc(sizeof(WCHAR)*len);
-		if (buf) {
-			len = vswprintf_s(buf, len, format, args);
-			if (len > 0) {
-				while (len && iswspace(buf[len-1])) len--;
-				buf[len++] = L'\r';
-				buf[len++] = L'\n';
-				buf[len] = 0;
-				OutputDebugStringW(buf);
-			}
-			free(buf);
-		}
-		va_end(args);
-	}
-}
-
-#endif //#ifndef ODPRINTF
-
-//=========================================================================
-#define MHOOKS_MAX_CODE_BYTES	32
-#define MHOOKS_MAX_RIPS			 4
-
-//=========================================================================
-// The trampoline structure - stores every bit of info about a hook
-struct MHOOKS_TRAMPOLINE {
-	PBYTE	pSystemFunction;								// the original system function
-	DWORD	cbOverwrittenCode;								// number of bytes overwritten by the jump
-	PBYTE	pHookFunction;									// the hook function that we provide
-	BYTE	codeJumpToHookFunction[MHOOKS_MAX_CODE_BYTES];	// placeholder for code that jumps to the hook function
-	BYTE	codeTrampoline[MHOOKS_MAX_CODE_BYTES];			// placeholder for code that holds the first few
-															//   bytes from the system function and a jump to the remainder
-															//   in the original location
-	BYTE	codeUntouched[MHOOKS_MAX_CODE_BYTES];			// placeholder for unmodified original code
-															//   (we patch IP-relative addressing)
-	MHOOKS_TRAMPOLINE* pPrevTrampoline;						// When in the free list, thess are pointers to the prev and next entry.
-	MHOOKS_TRAMPOLINE* pNextTrampoline;						// When not in the free list, this is a pointer to the prev and next trampoline in use.
-};
-
-//=========================================================================
-// The patch data structures - store info about rip-relative instructions
-// during hook placement
-struct MHOOKS_RIPINFO
-{
-	DWORD	dwOffset;
-	S64		nDisplacement;
-};
-
-struct MHOOKS_PATCHDATA
-{
-	S64				nLimitUp;
-	S64				nLimitDown;
-	DWORD			nRipCnt;
-	MHOOKS_RIPINFO	rips[MHOOKS_MAX_RIPS];
-};
-
-//=========================================================================
 // Global vars
 static BOOL g_bVarsInitialized = FALSE;
 static CRITICAL_SECTION g_cs;
-static MHOOKS_TRAMPOLINE* g_pHooks = NULL;
-static MHOOKS_TRAMPOLINE* g_pFreeList = NULL;
+static MHOOKS_TRAMPOLINE* g_pHooks[MHOOKS_MAX_SUPPORTED_HOOKS];
 static DWORD g_nHooksInUse = 0;
-static HANDLE* g_hThreadHandles = NULL;
-static DWORD g_nThreadHandles = 0;
+static PAGE_INFO* g_pPagesCache[MHOOKS_MAX_SUPPORTED_HOOKS];
+static DWORD g_PageSize = 0;
+static DWORD g_TramplinesInPage = 0;
 #define MHOOK_JMPSIZE 5
-#define MHOOK_MINALLOCSIZE 4096
-
-//=========================================================================
-// Toolhelp defintions so the functions can be dynamically bound to
-typedef HANDLE (WINAPI * _CreateToolhelp32Snapshot)(
-	DWORD dwFlags,	   
-	DWORD th32ProcessID  
-	);
-
-typedef BOOL (WINAPI * _Thread32First)(
-									   HANDLE hSnapshot,	 
-									   LPTHREADENTRY32 lpte
-									   );
-
-typedef BOOL (WINAPI * _Thread32Next)(
-									  HANDLE hSnapshot,	 
-									  LPTHREADENTRY32 lpte
-									  );
-
-//=========================================================================
-// Bring in the toolhelp functions from kernel32
-_CreateToolhelp32Snapshot fnCreateToolhelp32Snapshot = (_CreateToolhelp32Snapshot) GetProcAddress(GetModuleHandle(L"kernel32"), "CreateToolhelp32Snapshot");
-_Thread32First fnThread32First = (_Thread32First) GetProcAddress(GetModuleHandle(L"kernel32"), "Thread32First");
-_Thread32Next fnThread32Next = (_Thread32Next) GetProcAddress(GetModuleHandle(L"kernel32"), "Thread32Next");
-
-//=========================================================================
-// Internal function:
-//
-// Remove the trampoline from the specified list, updating the head pointer
-// if necessary.
-//=========================================================================
-static VOID ListRemove(MHOOKS_TRAMPOLINE** pListHead, MHOOKS_TRAMPOLINE* pNode) {
-	if (pNode->pPrevTrampoline) {
-		pNode->pPrevTrampoline->pNextTrampoline = pNode->pNextTrampoline;
-	}
-
-	if (pNode->pNextTrampoline) {
-		pNode->pNextTrampoline->pPrevTrampoline = pNode->pPrevTrampoline;
-	}
-
-	if ((*pListHead) == pNode) {
-		(*pListHead) = pNode->pNextTrampoline;
-		if (*pListHead != NULL) {
-			assert((*pListHead)->pPrevTrampoline == NULL);
-		}
-	}
-
-	pNode->pPrevTrampoline = NULL;
-	pNode->pNextTrampoline = NULL;
-}
-
-//=========================================================================
-// Internal function:
-//
-// Prepend the trampoline from the specified list and update the head pointer.
-//=========================================================================
-static VOID ListPrepend(MHOOKS_TRAMPOLINE** pListHead, MHOOKS_TRAMPOLINE* pNode) {
-	pNode->pPrevTrampoline = NULL;
-	pNode->pNextTrampoline = (*pListHead);
-	if ((*pListHead)) {
-		(*pListHead)->pPrevTrampoline = pNode;
-	}
-	(*pListHead) = pNode;
-}
-
 //=========================================================================
 static VOID EnterCritSec() {
 	if (!g_bVarsInitialized) {
 		InitializeCriticalSection(&g_cs);
+		ZeroMemory(g_pHooks, sizeof(g_pHooks));
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        g_PageSize = si.dwPageSize;
+        g_TramplinesInPage = (g_PageSize / sizeof(MHOOKS_TRAMPOLINE)) - 1;
+        ZeroMemory(g_pPagesCache, sizeof(g_pPagesCache));
+        ODPRINTF((L"mhooks: Mhook_SetHook(first call): page size %d, trampline size %d, tramplines in page %d"
+            , g_PageSize
+            , sizeof(MHOOKS_TRAMPOLINE)
+            , g_TramplinesInPage));
+
 		g_bVarsInitialized = TRUE;
 	}
 	EnterCriticalSection(&g_cs);
@@ -313,84 +160,50 @@ static PBYTE EmitJump(PBYTE pbCode, PBYTE pbJumpTo) {
 //
 // Round down to the next multiple of rndDown
 //=========================================================================
-static size_t RoundDown(size_t addr, size_t rndDown)
+static MHOOKS_TRAMPOLINE* TrampolineAllocInCache(PBYTE pLower, PBYTE pUpper)
 {
-	return (addr / rndDown) * rndDown;
-}
+    for (int pageIndex = 0; pageIndex < MHOOKS_MAX_SUPPORTED_HOOKS; ++pageIndex)
+    {
+        if (NULL == g_pPagesCache[pageIndex])
+        {
+            continue;
+        }
 
-//=========================================================================
-// Internal function:
-//
-// Will attempt allocate a block of memory within the specified range, as 
-// near as possible to the specified function.
-//=========================================================================
-static MHOOKS_TRAMPOLINE* BlockAlloc(PBYTE pSystemFunction, PBYTE pbLower, PBYTE pbUpper) {
-	SYSTEM_INFO sSysInfo =  {0};
-	::GetSystemInfo(&sSysInfo);
+        PBYTE pageAddr = (PBYTE)g_pPagesCache[pageIndex];
 
-	// Always allocate in bulk, in case the system actually has a smaller allocation granularity than MINALLOCSIZE.
-	const ptrdiff_t cAllocSize = max(sSysInfo.dwAllocationGranularity, MHOOK_MINALLOCSIZE);
+        if (pLower <= pageAddr && pageAddr < pUpper)
+        {
+            PAGE_INFO* pi = g_pPagesCache[pageIndex];
+            if (pi->counter == g_TramplinesInPage)
+            {
+                continue;
+            }
 
-	MHOOKS_TRAMPOLINE* pRetVal = NULL;
-	PBYTE pModuleGuess = (PBYTE) RoundDown((size_t)pSystemFunction, cAllocSize);
-	int loopCount = 0;
-	for (PBYTE pbAlloc = pModuleGuess; pbLower < pbAlloc && pbAlloc < pbUpper; ++loopCount) {
-		// determine current state
-		MEMORY_BASIC_INFORMATION mbi;
-		ODPRINTF((L"mhooks: BlockAlloc: Looking at address %p", pbAlloc));
-		if (!VirtualQuery(pbAlloc, &mbi, sizeof(mbi)))
-			break;
-		// free & large enough?
-		if (mbi.State == MEM_FREE && mbi.RegionSize >= (unsigned)cAllocSize) {
-			// and then try to allocate it
-			pRetVal = (MHOOKS_TRAMPOLINE*) VirtualAlloc(pbAlloc, cAllocSize, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-			if (pRetVal) {
-				size_t trampolineCount = cAllocSize / sizeof(MHOOKS_TRAMPOLINE);
-				ODPRINTF((L"mhooks: BlockAlloc: Allocated block at %p as %d trampolines", pRetVal, trampolineCount));
+            ODPRINTF((L"mhooks: Found page in cache: Page address %p, counter %d", pageAddr, pi->counter));
 
-				pRetVal[0].pPrevTrampoline = NULL;
-				pRetVal[0].pNextTrampoline = &pRetVal[1];
-
-				// prepare them by having them point down the line at the next entry.
-				for (size_t s = 1; s < trampolineCount; ++s) {
-					pRetVal[s].pPrevTrampoline = &pRetVal[s - 1];
-					pRetVal[s].pNextTrampoline = &pRetVal[s + 1];
-				}
-
-				// last entry points to the current head of the free list
-				pRetVal[trampolineCount - 1].pNextTrampoline = g_pFreeList;
-				break;
-			}
+            for (DWORD tramplineIndex = 0; tramplineIndex < g_TramplinesInPage; ++tramplineIndex)
+            {
+                if (NULL != pi->pTramplines[tramplineIndex].pSystemFunction || pi->pTramplines[tramplineIndex].reserved != FALSE)
+                {
+                    continue;
 		}
 				
-		// This is a spiral, should be -1, 1, -2, 2, -3, 3, etc. (* cAllocSize)
-		ptrdiff_t bytesToOffset = (cAllocSize * (loopCount + 1) * ((loopCount % 2 == 0) ? -1 : 1));
-		pbAlloc = pbAlloc + bytesToOffset;
-	}
+                DWORD oldProtect = 0;
+                VirtualProtect(pi, g_PageSize, PAGE_EXECUTE_READWRITE, &oldProtect);
 	
-	return pRetVal;
-}
+                MHOOKS_TRAMPOLINE* pTrampoline = &pi->pTramplines[tramplineIndex];
+                pTrampoline->pPageInfo = pi;
+                pTrampoline->reserved = TRUE;
+                pi->counter += 1;
 
-//=========================================================================
-// Internal function:
-//
-// Will try to allocate a big block of memory inside the required range. 
-//=========================================================================
-static MHOOKS_TRAMPOLINE* FindTrampolineInRange(PBYTE pLower, PBYTE pUpper) {
-	if (!g_pFreeList) {
-		return NULL;
-	}
+                VirtualProtect(pi, g_PageSize, oldProtect, &oldProtect);
 
-	// This is a standard free list, except we're doubly linked to deal with soem return shenanigans.
-	MHOOKS_TRAMPOLINE* curEntry = g_pFreeList;
-	while (curEntry) {
-		if ((MHOOKS_TRAMPOLINE*) pLower < curEntry && curEntry < (MHOOKS_TRAMPOLINE*) pUpper) {
-			ListRemove(&g_pFreeList, curEntry);
+                ODPRINTF((L"mhooks: Found free trampline in page: Page address %p, counter %d, trampline addr %p"
+                    , pageAddr, pi->counter, pTrampoline));
 
-			return curEntry;
+                return pTrampoline;
+            }
 		}
-
-		curEntry = curEntry->pNextTrampoline;
 	}
 
 	return NULL;
@@ -406,6 +219,9 @@ static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S
 
 	MHOOKS_TRAMPOLINE* pTrampoline = NULL;
 
+    // do we have room to store this guy?
+    if (g_nHooksInUse < MHOOKS_MAX_SUPPORTED_HOOKS) {
+
 	// determine lower and upper bounds for the allocation locations.
 	// in the basic scenario this is +/- 2GB but IP-relative instructions
 	// found in the original code may require a smaller window.
@@ -417,18 +233,67 @@ static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S
 		(PBYTE)(pUpper + (DWORD_PTR)0x7ff80000) : (PBYTE)(DWORD_PTR)0xfffffffffff80000;
 	ODPRINTF((L"mhooks: TrampolineAlloc: Allocating for %p between %p and %p", pSystemFunction, pLower, pUpper));
 
-	// try to find a trampoline in the specified range
-	pTrampoline = FindTrampolineInRange(pLower, pUpper);
-	if (!pTrampoline) {
-		// if it we can't find it, then we need to allocate a new block and 
-		// try again. Just fail if that doesn't work 
-		g_pFreeList = BlockAlloc(pSystemFunction, pLower, pUpper);
-		pTrampoline = FindTrampolineInRange(pLower, pUpper);
+        pTrampoline = TrampolineAllocInCache(pLower, pUpper);
+
+        if (NULL == pTrampoline)
+        {
+            SYSTEM_INFO sSysInfo = { 0 };
+            ::GetSystemInfo(&sSysInfo);
+
+            // go through the available memory blocks and try to allocate a chunk for us
+            for (PBYTE pbAlloc = pLower; pbAlloc < pUpper;) {
+                // determine current state
+                MEMORY_BASIC_INFORMATION mbi;
+                ODPRINTF((L"mhooks: TrampolineAlloc: Looking at address %p", pbAlloc));
+                if (!VirtualQuery(pbAlloc, &mbi, sizeof(mbi)))
+                    break;
+                // free & large enough?
+                if (mbi.State == MEM_FREE && mbi.RegionSize >= g_PageSize && mbi.RegionSize >= sSysInfo.dwAllocationGranularity) {
+                    // yes, align the pointer to the 64K boundary first
+                    pbAlloc = (PBYTE)(ULONG_PTR((ULONG_PTR(pbAlloc) + (sSysInfo.dwAllocationGranularity - 1)) / sSysInfo.dwAllocationGranularity) * sSysInfo.dwAllocationGranularity);
+                    // and then try to allocate it
+
+                    PAGE_INFO *pageInfo = (PAGE_INFO*)VirtualAlloc(pbAlloc, g_PageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                    if (!pageInfo)
+                    {
+                        continue;
+                    }
+
+                    pTrampoline = &pageInfo->pTramplines[0];
+                    pTrampoline->pPageInfo = pageInfo;
+                    pTrampoline->reserved = TRUE;
+                    pageInfo->counter = 1;
+                    ODPRINTF((L"mhooks: TrampolineAlloc: Allocated block at %p as the trampoline", pTrampoline));
+
+                    DWORD oldProtect = 0;
+                    VirtualProtect(pageInfo, g_PageSize, PAGE_EXECUTE_READ, &oldProtect);
+
+                    for (int i = 0; i < MHOOKS_MAX_SUPPORTED_HOOKS; ++i)
+                    {
+                        if (NULL == g_pPagesCache[i])
+                        {
+                            g_pPagesCache[i] = pageInfo;
+                            break;
+                        }
+                    }
+                    break;
+                }
+                // continue the search
+                pbAlloc = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+            }
 	}
 
 	// found and allocated a trampoline?
 	if (pTrampoline) {
-		ListPrepend(&g_pHooks, pTrampoline);
+            // put it into our list so we know we'll have to free it
+            for (DWORD i = 0; i < MHOOKS_MAX_SUPPORTED_HOOKS; i++) {
+                if (g_pHooks[i] == NULL) {
+                    g_pHooks[i] = pTrampoline;
+                    g_nHooksInUse++;
+                    break;
+                }
+            }
+        }
 	}
 
 	return pTrampoline;
@@ -440,14 +305,11 @@ static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S
 // Return the internal trampoline structure that belongs to a hooked function.
 //=========================================================================
 static MHOOKS_TRAMPOLINE* TrampolineGet(PBYTE pHookedFunction) {
-	MHOOKS_TRAMPOLINE* pCurrent = g_pHooks;
-
-	while (pCurrent) {
-		if ((PBYTE)&(pCurrent->codeTrampoline) == pHookedFunction) {
-			return pCurrent;
+	for (DWORD i=0; i<MHOOKS_MAX_SUPPORTED_HOOKS; i++) {
+		if (g_pHooks[i]) {
+			if (g_pHooks[i]->codeTrampoline == pHookedFunction)
+				return g_pHooks[i];
 		}
-
-		pCurrent = pCurrent->pNextTrampoline;
 	}
 
 	return NULL;
@@ -459,177 +321,44 @@ static MHOOKS_TRAMPOLINE* TrampolineGet(PBYTE pHookedFunction) {
 // Free a trampoline structure.
 //=========================================================================
 static VOID TrampolineFree(MHOOKS_TRAMPOLINE* pTrampoline, BOOL bNeverUsed) {
-	ListRemove(&g_pHooks, pTrampoline);
+	for (DWORD i=0; i<MHOOKS_MAX_SUPPORTED_HOOKS; i++) {
+		if (g_pHooks[i] == pTrampoline) {
+			g_pHooks[i] = NULL;
+			// It might be OK to call VirtualFree, but quite possibly it isn't: 
+			// If a thread has some of our trampoline code on its stack
+			// and we yank the region from underneath it then it will
+			// surely crash upon returning. So instead of freeing the 
+			// memory we just let it leak. Ugly, but safe.
+			if (bNeverUsed)
+            {
+                PAGE_INFO * pi = pTrampoline->pPageInfo;
 
-	// If a thread could feasinbly have some of our trampoline code 
-	// on its stack and we yank the region from underneath it then it will
-	// surely crash upon returning. So instead of freeing the 
-	// memory we just let it leak. Ugly, but safe.
-	if (bNeverUsed) {
-		ListPrepend(&g_pFreeList, pTrampoline);
-	}
+                DWORD oldProtect = 0;
+                VirtualProtect(pi, g_PageSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+                pi->counter -= 1;
+                VirtualProtect(pi, g_PageSize, oldProtect, &oldProtect);
 
-	g_nHooksInUse--;
-}
-
-//=========================================================================
-// Internal function:
-//
-// Suspend a given thread and try to make sure that its instruction
-// pointer is not in the given range.
-//=========================================================================
-static HANDLE SuspendOneThread(DWORD dwThreadId, PBYTE pbCode, DWORD cbBytes) {
-	// open the thread
-	HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, dwThreadId);
-	if (GOOD_HANDLE(hThread)) {
-		// attempt suspension
-		DWORD dwSuspendCount = SuspendThread(hThread);
-		if (dwSuspendCount != -1) {
-			// see where the IP is
-			CONTEXT ctx;
-			ctx.ContextFlags = CONTEXT_CONTROL;
-			int nTries = 0;
-			while (GetThreadContext(hThread, &ctx)) {
-#ifdef _M_IX86
-				PBYTE pIp = (PBYTE)(DWORD_PTR)ctx.Eip;
-#elif defined _M_X64
-				PBYTE pIp = (PBYTE)(DWORD_PTR)ctx.Rip;
-#endif
-				if (pIp >= pbCode && pIp < (pbCode + cbBytes)) {
-					if (nTries < 3) {
-						// oops - we should try to get the instruction pointer out of here. 
-						ODPRINTF((L"mhooks: SuspendOneThread: suspended thread %d - IP is at %p - IS COLLIDING WITH CODE", dwThreadId, pIp));
-						ResumeThread(hThread);
-						Sleep(100);
-						SuspendThread(hThread);
-						nTries++;
-					} else {
-						// we gave it all we could. (this will probably never 
-						// happen - unless the thread has already been suspended 
-						// to begin with)
-						ODPRINTF((L"mhooks: SuspendOneThread: suspended thread %d - IP is at %p - IS COLLIDING WITH CODE - CAN'T FIX", dwThreadId, pIp));
-						ResumeThread(hThread);
-						CloseHandle(hThread);
-						hThread = NULL;
+                if (0 == pi->counter)
+                {
+                    for (int i = 0; i < MHOOKS_MAX_SUPPORTED_HOOKS; ++i)
+                    {
+                        if (g_pPagesCache[i] == pi)
+                        {
+                            g_pPagesCache[i] = NULL;
 						break;
-					}
-				} else {
-					// success, the IP is not conflicting
-					ODPRINTF((L"mhooks: SuspendOneThread: Successfully suspended thread %d - IP is at %p", dwThreadId, pIp));
-					break;
-				}
-			}
-		} else {
-			// couldn't suspend
-			CloseHandle(hThread);
-			hThread = NULL;
-		}
-	}
-	return hThread;
-}
-
-//=========================================================================
-// Internal function:
-//
-// Resumes all previously suspended threads in the current process.
-//=========================================================================
-static VOID ResumeOtherThreads() {
-	// make sure things go as fast as possible
-	INT nOriginalPriority = GetThreadPriority(GetCurrentThread());
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-	// go through our list
-	for (DWORD i=0; i<g_nThreadHandles; i++) {
-		// and resume & close thread handles
-		ResumeThread(g_hThreadHandles[i]);
-		CloseHandle(g_hThreadHandles[i]);
-	}
-	// clean up
-	free(g_hThreadHandles);
-	g_hThreadHandles = NULL;
-	g_nThreadHandles = 0;
-	SetThreadPriority(GetCurrentThread(), nOriginalPriority);
-}
-
-//=========================================================================
-// Internal function:
-//
-// Suspend all threads in this process while trying to make sure that their 
-// instruction pointer is not in the given range.
-//=========================================================================
-static BOOL SuspendOtherThreads(PBYTE pbCode, DWORD cbBytes) {
-	BOOL bRet = FALSE;
-	// make sure we're the most important thread in the process
-	INT nOriginalPriority = GetThreadPriority(GetCurrentThread());
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-	// get a view of the threads in the system
-	HANDLE hSnap = fnCreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, GetCurrentProcessId());
-	if (GOOD_HANDLE(hSnap)) {
-		THREADENTRY32 te;
-		te.dwSize = sizeof(te);
-		// count threads in this process (except for ourselves)
-		DWORD nThreadsInProcess = 0;
-		if (fnThread32First(hSnap, &te)) {
-			do {
-				if (te.th32OwnerProcessID == GetCurrentProcessId()) {
-					if (te.th32ThreadID != GetCurrentThreadId()) {
-						nThreadsInProcess++;
-					}
-				}
-				te.dwSize = sizeof(te);
-			} while(fnThread32Next(hSnap, &te));
-		}
-		ODPRINTF((L"mhooks: SuspendOtherThreads: counted %d other threads", nThreadsInProcess));
-		if (nThreadsInProcess) {
-			// alloc buffer for the handles we really suspended
-			g_hThreadHandles = (HANDLE*)malloc(nThreadsInProcess*sizeof(HANDLE));
-			if (g_hThreadHandles) {
-				ZeroMemory(g_hThreadHandles, nThreadsInProcess*sizeof(HANDLE));
-				DWORD nCurrentThread = 0;
-				BOOL bFailed = FALSE;
-				te.dwSize = sizeof(te);
-				// go through every thread
-				if (fnThread32First(hSnap, &te)) {
-					do {
-						if (te.th32OwnerProcessID == GetCurrentProcessId()) {
-							if (te.th32ThreadID != GetCurrentThreadId()) {
-								// attempt to suspend it
-								g_hThreadHandles[nCurrentThread] = SuspendOneThread(te.th32ThreadID, pbCode, cbBytes);
-								if (GOOD_HANDLE(g_hThreadHandles[nCurrentThread])) {
-									ODPRINTF((L"mhooks: SuspendOtherThreads: successfully suspended %d", te.th32ThreadID));
-									nCurrentThread++;
-								} else {
-									ODPRINTF((L"mhooks: SuspendOtherThreads: error while suspending thread %d: %d", te.th32ThreadID, gle()));
-									// TODO: this might not be the wisest choice
-									// but we can choose to ignore failures on
-									// thread suspension. It's pretty unlikely that
-									// we'll fail - and even if we do, the chances
-									// of a thread's IP being in the wrong place
-									// is pretty small.
-									// bFailed = TRUE;
-								}
-							}
 						}
-						te.dwSize = sizeof(te);
-					} while(fnThread32Next(hSnap, &te) && !bFailed);
+					}
+	                VirtualFree(pi, 0, MEM_RELEASE);
 				}
-				g_nThreadHandles = nCurrentThread;
-				bRet = !bFailed;
+	            else
+	            {
+	                ZeroMemory(pTrampoline, sizeof(MHOOKS_TRAMPOLINE));
+				}
 			}
+			g_nHooksInUse--;
+			break;
 		}
-		CloseHandle(hSnap);
-		//TODO: we might want to have another pass to make sure all threads
-		// in the current process (including those that might have been
-		// created since we took the original snapshot) have been 
-		// suspended.
-	} else {
-		ODPRINTF((L"mhooks: SuspendOtherThreads: can't CreateToolhelp32Snapshot: %d", gle()));
 	}
-	SetThreadPriority(GetCurrentThread(), nOriginalPriority);
-	if (!bRet) {
-		ODPRINTF((L"mhooks: SuspendOtherThreads: Had a problem (or not running multithreaded), resuming all threads."));
-		ResumeOtherThreads();
-	}
-	return bRet;
 }
 
 //=========================================================================
@@ -766,56 +495,147 @@ static DWORD DisassembleAndSkip(PVOID pFunction, DWORD dwMinLen, MHOOKS_PATCHDAT
 	return dwRet;
 }
 
+static BOOL FindSystemFunction(HOOK_CONTEXT* hookCtx, int fromIdx, int toIdx, PVOID pSystemFunction)
+{
+    for (int idx = fromIdx; idx < toIdx; idx++)
+    {
+        if (hookCtx[idx].pSystemFunction == pSystemFunction)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 //=========================================================================
-BOOL Mhook_SetHook(PVOID *ppSystemFunction, PVOID pHookFunction) {
-	MHOOKS_TRAMPOLINE* pTrampoline = NULL;
-	PVOID pSystemFunction = *ppSystemFunction;
-	// ensure thread-safety
+// code is based on the Mhook_SetHook
+void Mhook_SetHookEx(HOOK_INFO* hooks, int hookCount)
+{
+    INT nOriginalPriority = 0;
+
+    HOOK_CONTEXT* hookCtx = (HOOK_CONTEXT*)malloc(hookCount * sizeof(HOOK_CONTEXT));
+
+    if (hookCtx == NULL)
+    {
+        // return error status
+
+        for (int idx = 0; idx < hookCount; idx++)
+        {
+            hooks[idx].hookStatus = MHOOK_HOOK_FAILED;
+        }
+
+        return;
+    }
+
 	EnterCritSec();
-	ODPRINTF((L"mhooks: Mhook_SetHook: Started on the job: %p / %p", pSystemFunction, pHookFunction));
+
+    for (int idx = 0; idx < hookCount; idx++)
+    {
+        hooks[idx].hookStatus = MHOOK_HOOK_FAILED;
+
+        hookCtx[idx].pSystemFunction = *hooks[idx].ppSystemFunction;
+        hookCtx[idx].pHookFunction = hooks[idx].pHookFunction;
+        hookCtx[idx].pTrampoline = NULL;
+        hookCtx[idx].dwInstructionLength = 0;
+        memset(&hookCtx[idx].patchdata, 0, sizeof(MHOOKS_PATCHDATA));
+
+        ODPRINTF((L"mhooks: Mhook_SetHook: Started on the job: %p / %p", hookCtx[idx].pSystemFunction, hookCtx[idx].pHookFunction));
+
 	// find the real functions (jump over jump tables, if any)
-	pSystemFunction = SkipJumps((PBYTE)pSystemFunction);
-	pHookFunction   = SkipJumps((PBYTE)pHookFunction);
-	ODPRINTF((L"mhooks: Mhook_SetHook: Started on the job: %p / %p", pSystemFunction, pHookFunction));
+        hookCtx[idx].pSystemFunction = SkipJumps((PBYTE)hookCtx[idx].pSystemFunction);
+        hookCtx[idx].pHookFunction = SkipJumps((PBYTE)hookCtx[idx].pHookFunction);
+
+        if (FindSystemFunction(hookCtx, 0, idx, hookCtx[idx].pSystemFunction))
+        {
+            // Same system function found. Skip it.
+
+            // It is not an error. 
+            // This case is possible when two system functions from different DLLs are stubs and they are redirected to the one internal implementation.
+            // We are going to hook first instance and skip other.
+
+            ODPRINTF((L"mhooks: Mhook_SetHook: already hooked: %p", hookCtx[idx].pSystemFunction));
+
+            hookCtx[idx].pTrampoline = NULL;
+            hooks[idx].hookStatus = MHOOK_HOOK_SKIPPED;
+        }
+        else
+        {
+            ODPRINTF((L"mhooks: Mhook_SetHook: Started on the job: %p / %p", hookCtx[idx].pSystemFunction, hookCtx[idx].pHookFunction));
+
 	// figure out the length of the overwrite zone
-	MHOOKS_PATCHDATA patchdata = {0};
-	DWORD dwInstructionLength = DisassembleAndSkip(pSystemFunction, MHOOK_JMPSIZE, &patchdata);
-	if (dwInstructionLength >= MHOOK_JMPSIZE) {
-		ODPRINTF((L"mhooks: Mhook_SetHook: disassembly signals %d bytes", dwInstructionLength));
-		// suspend every other thread in this process, and make sure their IP 
-		// is not in the code we're about to overwrite.
-		SuspendOtherThreads((PBYTE)pSystemFunction, dwInstructionLength);
+            hookCtx[idx].dwInstructionLength = DisassembleAndSkip(hookCtx[idx].pSystemFunction, MHOOK_JMPSIZE, &hookCtx[idx].patchdata);
+
+            if (hookCtx[idx].dwInstructionLength >= MHOOK_JMPSIZE)
+            {
+                ODPRINTF((L"mhooks: Mhook_SetHook: disassembly signals %d bytes", hookCtx[idx].dwInstructionLength));
+
 		// allocate a trampoline structure (TODO: it is pretty wasteful to get
 		// VirtualAlloc to grab chunks of memory smaller than 100 bytes)
-		pTrampoline = TrampolineAlloc((PBYTE)pSystemFunction, patchdata.nLimitUp, patchdata.nLimitDown);
-		if (pTrampoline) {
-			ODPRINTF((L"mhooks: Mhook_SetHook: allocated structure at %p", pTrampoline));
+                hookCtx[idx].pTrampoline = TrampolineAlloc((PBYTE)hookCtx[idx].pSystemFunction, hookCtx[idx].patchdata.nLimitUp, hookCtx[idx].patchdata.nLimitDown);
+            }
+            else
+            {
+                // error - skip hook
+                ODPRINTF((L"mhooks: disassembly signals %d bytes (unacceptable)", hookCtx[idx].dwInstructionLength));
+            }
+        }
+    }
+
+    if (true)
+    {
+        // make sure we're the most important thread in the process
+        nOriginalPriority = GetThreadPriority(GetCurrentThread());
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
+
+	void *freeCtx = nullptr;
+
+    // suspend threads
+    SuspendOtherThreads(hookCtx, hookCount, &freeCtx);
+
+    if (true)
+    {
+        SetThreadPriority(GetCurrentThread(), nOriginalPriority);
+    }
+
+    // the next code is same to the Mhook_SetHook.  Differences are only in using hookCtx[i]
+    for (int i = 0; i < hookCount; i++)
+    {
+        if (hookCtx[i].pTrampoline)
+        {
+            ODPRINTF((L"mhooks: Mhook_SetHook: allocated structure at %p", hookCtx[i].pTrampoline));
 			DWORD dwOldProtectSystemFunction = 0;
 			DWORD dwOldProtectTrampolineFunction = 0;
 			// set the system function to PAGE_EXECUTE_READWRITE
-			if (VirtualProtect(pSystemFunction, dwInstructionLength, PAGE_EXECUTE_READWRITE, &dwOldProtectSystemFunction)) {
+            if (VirtualProtect(hookCtx[i].pSystemFunction, hookCtx[i].dwInstructionLength, PAGE_EXECUTE_READWRITE, &dwOldProtectSystemFunction))
+            {
 				ODPRINTF((L"mhooks: Mhook_SetHook: readwrite set on system function"));
 				// mark our trampoline buffer to PAGE_EXECUTE_READWRITE
-				if (VirtualProtect(pTrampoline, sizeof(MHOOKS_TRAMPOLINE), PAGE_EXECUTE_READWRITE, &dwOldProtectTrampolineFunction)) {
+                if (VirtualProtect(hookCtx[i].pTrampoline, sizeof(MHOOKS_TRAMPOLINE), PAGE_EXECUTE_READWRITE, &dwOldProtectTrampolineFunction))
+                {
 					ODPRINTF((L"mhooks: Mhook_SetHook: readwrite set on trampoline structure"));
 
 					// create our trampoline function
-					PBYTE pbCode = pTrampoline->codeTrampoline;
+                    PBYTE pbCode = hookCtx[i].pTrampoline->codeTrampoline;
+
 					// save original code..
-					for (DWORD i = 0; i<dwInstructionLength; i++) {
-						pTrampoline->codeUntouched[i] = pbCode[i] = ((PBYTE)pSystemFunction)[i];
+                    for (DWORD k = 0; k < hookCtx[i].dwInstructionLength; k++) {
+                        hookCtx[i].pTrampoline->codeUntouched[k] = pbCode[k] = ((PBYTE)hookCtx[i].pSystemFunction)[k];
 					}
-					pbCode += dwInstructionLength;
+                    pbCode += hookCtx[i].dwInstructionLength;
+
 					// plus a jump to the continuation in the original location
-					pbCode = EmitJump(pbCode, ((PBYTE)pSystemFunction) + dwInstructionLength);
+                    pbCode = EmitJump(pbCode, ((PBYTE)hookCtx[i].pSystemFunction) + hookCtx[i].dwInstructionLength);
 					ODPRINTF((L"mhooks: Mhook_SetHook: updated the trampoline"));
 
 					// fix up any IP-relative addressing in the code
-					FixupIPRelativeAddressing(pTrampoline->codeTrampoline, (PBYTE)pSystemFunction, &patchdata);
+                    FixupIPRelativeAddressing(hookCtx[i].pTrampoline->codeTrampoline, (PBYTE)hookCtx[i].pSystemFunction, &hookCtx[i].patchdata);
 
-					DWORD_PTR dwDistance = (PBYTE)pHookFunction < (PBYTE)pSystemFunction ? 
-						(PBYTE)pSystemFunction - (PBYTE)pHookFunction : (PBYTE)pHookFunction - (PBYTE)pSystemFunction;
-					if (dwDistance > 0x7fff0000) {
+                    DWORD_PTR dwDistance = (PBYTE)hookCtx[i].pHookFunction < (PBYTE)hookCtx[i].pSystemFunction ?
+                        (PBYTE)hookCtx[i].pSystemFunction - (PBYTE)hookCtx[i].pHookFunction : (PBYTE)hookCtx[i].pHookFunction - (PBYTE)hookCtx[i].pSystemFunction;
+                    if (dwDistance > 0x7fff0000)
+                    {
 						// create a stub that jumps to the replacement function.
 						// we need this because jumping from the API to the hook directly 
 						// will be a long jump, which is 14 bytes on x64, and we want to 
@@ -825,57 +645,89 @@ BOOL Mhook_SetHook(PVOID *ppSystemFunction, PVOID pHookFunction) {
 						// within +/- 2GB of the API, so we do the long jump in there. 
 						// the API will jump to the "reverse trampoline" which
 						// will jump to the user's hook code.
-						pbCode = pTrampoline->codeJumpToHookFunction;
-						pbCode = EmitJump(pbCode, (PBYTE)pHookFunction);
+                        pbCode = hookCtx[i].pTrampoline->codeJumpToHookFunction;
+                        pbCode = EmitJump(pbCode, (PBYTE)hookCtx[i].pHookFunction);
 						ODPRINTF((L"mhooks: Mhook_SetHook: created reverse trampoline"));
-						FlushInstructionCache(GetCurrentProcess(), pTrampoline->codeJumpToHookFunction, 
-							pbCode - pTrampoline->codeJumpToHookFunction);
+                        FlushInstructionCache(GetCurrentProcess(), hookCtx[i].pTrampoline->codeJumpToHookFunction,
+                            pbCode - hookCtx[i].pTrampoline->codeJumpToHookFunction);
 
 						// update the API itself
-						pbCode = (PBYTE)pSystemFunction;
-						pbCode = EmitJump(pbCode, pTrampoline->codeJumpToHookFunction);
-					} else {
+                        pbCode = (PBYTE)hookCtx[i].pSystemFunction;
+                        pbCode = EmitJump(pbCode, hookCtx[i].pTrampoline->codeJumpToHookFunction);
+                    }
+                    else
+                    {
 						// the jump will be at most 5 bytes so we can do it directly
 						// update the API itself
-						pbCode = (PBYTE)pSystemFunction;
-						pbCode = EmitJump(pbCode, (PBYTE)pHookFunction);
+                        pbCode = (PBYTE)hookCtx[i].pSystemFunction;
+                        pbCode = EmitJump(pbCode, (PBYTE)hookCtx[i].pHookFunction);
 					}
 
 					// update data members
-					pTrampoline->cbOverwrittenCode = dwInstructionLength;
-					pTrampoline->pSystemFunction = (PBYTE)pSystemFunction;
-					pTrampoline->pHookFunction = (PBYTE)pHookFunction;
+                    hookCtx[i].pTrampoline->cbOverwrittenCode = hookCtx[i].dwInstructionLength;
+                    hookCtx[i].pTrampoline->pSystemFunction = (PBYTE)hookCtx[i].pSystemFunction;
+                    hookCtx[i].pTrampoline->pHookFunction = (PBYTE)hookCtx[i].pHookFunction;
 
 					// flush instruction cache and restore original protection
-					FlushInstructionCache(GetCurrentProcess(), pTrampoline->codeTrampoline, dwInstructionLength);
-					VirtualProtect(pTrampoline, sizeof(MHOOKS_TRAMPOLINE), dwOldProtectTrampolineFunction, &dwOldProtectTrampolineFunction);
-				} else {
+                    FlushInstructionCache(GetCurrentProcess(), hookCtx[i].pTrampoline->codeTrampoline, hookCtx[i].dwInstructionLength);
+                    VirtualProtect(hookCtx[i].pTrampoline, sizeof(MHOOKS_TRAMPOLINE), dwOldProtectTrampolineFunction, &dwOldProtectTrampolineFunction);
+                }
+                else
+                {
 					ODPRINTF((L"mhooks: Mhook_SetHook: failed VirtualProtect 2: %d", gle()));
 				}
 				// flush instruction cache and restore original protection
-				FlushInstructionCache(GetCurrentProcess(), pSystemFunction, dwInstructionLength);
-				VirtualProtect(pSystemFunction, dwInstructionLength, dwOldProtectSystemFunction, &dwOldProtectSystemFunction);
-			} else {
+                FlushInstructionCache(GetCurrentProcess(), hookCtx[i].pSystemFunction, hookCtx[i].dwInstructionLength);
+                VirtualProtect(hookCtx[i].pSystemFunction, hookCtx[i].dwInstructionLength, dwOldProtectSystemFunction, &dwOldProtectSystemFunction);
+            }
+            else
+            {
 				ODPRINTF((L"mhooks: Mhook_SetHook: failed VirtualProtect 1: %d", gle()));
 			}
-			if (pTrampoline->pSystemFunction) {
+
+            if (hookCtx[i].pTrampoline->pSystemFunction)
+            {
 				// this is what the application will use as the entry point
 				// to the "original" unhooked function.
-				*ppSystemFunction = pTrampoline->codeTrampoline;
+                *hooks[i].ppSystemFunction = hookCtx[i].pTrampoline->codeTrampoline;
 				ODPRINTF((L"mhooks: Mhook_SetHook: Hooked the function!"));
-			} else {
+            }
+            else
+            {
 				// if we failed discard the trampoline (forcing VirtualFree)
-				TrampolineFree(pTrampoline, TRUE);
-				pTrampoline = NULL;
+                TrampolineFree(hookCtx[i].pTrampoline, TRUE);
+                hookCtx[i].pTrampoline = NULL;
 			}
+
+            hooks[i].hookStatus = hookCtx[i].pTrampoline != NULL ? MHOOK_HOOK_INSTALLED : MHOOK_HOOK_FAILED;
+        }
+    }
+
+    if (true)
+    {
+        // make sure we're the most important thread in the process
+        nOriginalPriority = GetThreadPriority(GetCurrentThread());
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 		}
-		// resume everybody else
-		ResumeOtherThreads();
-	} else {
-		ODPRINTF((L"mhooks: disassembly signals %d bytes (unacceptable)", dwInstructionLength));
+
+    // resume threads
+    ResumeOtherThreads(freeCtx);
+
+    if (true)
+    {
+        SetThreadPriority(GetCurrentThread(), nOriginalPriority);
 	}
+
+    free(hookCtx);
+
 	LeaveCritSec();
-	return (pTrampoline != NULL);
+}
+
+BOOL Mhook_SetHook(PVOID *ppSystemFunction, PVOID pHookFunction)
+{
+    HOOK_INFO hook = { ppSystemFunction , pHookFunction, MHOOK_HOOK_FAILED, nullptr };
+    Mhook_SetHookEx(&hook, 1);
+    return hook.hookStatus != MHOOK_HOOK_FAILED;
 }
 
 //=========================================================================
@@ -886,8 +738,10 @@ BOOL Mhook_Unhook(PVOID *ppHookedFunction) {
 	// get the trampoline structure that corresponds to our function
 	MHOOKS_TRAMPOLINE* pTrampoline = TrampolineGet((PBYTE)*ppHookedFunction);
 	if (pTrampoline) {
+        HOOK_CONTEXT ctx = { pTrampoline->pSystemFunction, ppHookedFunction, pTrampoline->cbOverwrittenCode, pTrampoline, { } };
 		// make sure nobody's executing code where we're about to overwrite a few bytes
-		SuspendOtherThreads(pTrampoline->pSystemFunction, pTrampoline->cbOverwrittenCode);
+		void *freeCtx = nullptr;
+		SuspendOtherThreads(&ctx, 1, &freeCtx);
 		ODPRINTF((L"mhooks: Mhook_Unhook: found struct at %p", pTrampoline));
 		DWORD dwOldProtectSystemFunction = 0;
 		// make memory writable
@@ -911,10 +765,20 @@ BOOL Mhook_Unhook(PVOID *ppHookedFunction) {
 			ODPRINTF((L"mhooks: Mhook_Unhook: failed VirtualProtect 1: %d", gle()));
 		}
 		// make the other guys runnable
-		ResumeOtherThreads();
+		ResumeOtherThreads(freeCtx);
 	}
 	LeaveCritSec();
 	return bRet;
 }
 
 //=========================================================================
+// For debug and unit tests only (MHOOK UNIT TEST = MHOOKUT)
+
+void MHOOKUT_GetGlobalVars(MHOOKUT_GlobalVars * gv)
+{
+    gv->Hooks = g_pHooks;
+    gv->HooksInUse = g_nHooksInUse;
+    gv->PagesCache = g_pPagesCache;
+    gv->PageSize = g_PageSize;
+    gv->TramplinesInPage = g_TramplinesInPage;
+}

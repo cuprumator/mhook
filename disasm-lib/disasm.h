@@ -455,6 +455,7 @@ typedef struct DECLSPEC_ALIGN(16) _U128
     U64 High;
 } U128;
 
+#pragma warning (push, 0)
 typedef struct _INSTRUCTION_OPERAND
 {
 	U32 Flags;
@@ -494,6 +495,7 @@ typedef struct _INSTRUCTION_OPERAND
 		U8 BCD[10];
 	};
 } INSTRUCTION_OPERAND;
+#pragma warning (pop)
 
 typedef struct _INSTRUCTION
 {

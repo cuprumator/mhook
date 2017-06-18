@@ -39,3 +39,4 @@ _ReSharper*/
 /pom/x86-windows-static-mt-msvc10-debug/target
 /pom/x86-windows-static-mt-msvc10-release/target
 /pom/x86-windows-static-mt-msvc11-release/target
+/3rd-party/gtest

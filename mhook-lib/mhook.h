@@ -18,11 +18,33 @@
 //FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS 
 //IN THE SOFTWARE.
 
+#pragma once
+
 #ifdef _M_IX86
 #define _M_IX86_X64
 #elif defined _M_X64
 #define _M_IX86_X64
 #endif
 
+enum MHOOK_STATUS
+{
+    MHOOK_HOOK_FAILED = 0,
+    MHOOK_HOOK_INSTALLED = 1,
+    MHOOK_HOOK_SKIPPED = 2
+};
+
+struct HOOK_INFO
+{
+    PVOID *ppSystemFunction;    // pointer to pointer to function to be hooked
+    PVOID pHookFunction;        // hook function
+
+    MHOOK_STATUS hookStatus;            // hooking result
+    const WCHAR* hookName;      // user defined hook name (used for debugging)
+};
+
+void Mhook_SetHookEx(HOOK_INFO* hooks, int hookCount);
 BOOL Mhook_SetHook(PVOID *ppSystemFunction, PVOID pHookFunction);
 BOOL Mhook_Unhook(PVOID *ppHookedFunction);
+
+#define MHOOKS_MAX_SUPPORTED_HOOKS	64
+
